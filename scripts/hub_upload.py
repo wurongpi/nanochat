@@ -56,9 +56,9 @@ assert set(sources) <= set(SOURCE_DIRS), f"--sources must be a subset of {list(S
 base_dir = get_base_dir()
 
 # -----------------------------------------------------------------------------
-# Stage the repo contents in a temp dir (hardlinks where possible, it's fast and free)
+# Stage the repo contents next to the checkpoints, so hardlinks work and /tmp doesn't fill up
 
-staging = tempfile.mkdtemp(prefix="nanochat_hub_")
+staging = tempfile.mkdtemp(prefix="hub_staging_", dir=base_dir)
 
 def stage(src, rel):
     dst = os.path.join(staging, rel)

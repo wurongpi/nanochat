@@ -8,6 +8,8 @@
 # screen -L -Logfile runs/code_rlvr.log -S code_rlvr bash runs/code_rlvr.sh
 #
 # Environment knobs:
+# NANOCHAT_BASE_DIR=...  data, checkpoints and evals (~35GB), e.g. /root/autodl-tmp/nanochat on AutoDL
+# UV_CACHE_DIR=...       uv's download cache (~7GB), keep it off a small system disk too
 # GPU=a800|4090          sets the per-device batch sizes (default a800)
 # START_STAGE=<stage>    resume from setup|tok|data|base|sft|rl|eval|upload
 # HF_ENDPOINT=...        hub mirror for downloads, e.g. https://hf-mirror.com
