@@ -20,28 +20,25 @@ import torch.nn.functional as F
 # =============================================================================
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
+def _fa3_kernel_name():
+    # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
+    # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
+    # The varunneal kernel obtains better results for H100/Hopper
+    major, _ = torch.cuda.get_device_capability()
+    return "varunneal/flash-attention-3" if major == 9 else "kernels-community/flash-attn3"
+
+
 def _load_flash_attention_3():
     """Try to load Flash Attention 3."""
     if not torch.cuda.is_available():
         return None
     try:
-        major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
-        # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel, has_kernel
-        # The varunneal kernel obtains better results for H100/Hopper
-        if major == 9:
-            hf_kernel = "varunneal/flash-attention-3"
-            return get_kernel(hf_kernel).flash_attn_interface
-        else:
-            hf_kernel = "kernels-community/flash-attn3"
-            if has_kernel(hf_kernel):
-                return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
-
+        from kernels import get_kernel
+        # load directly rather than probing with has_kernel(): the probe needs the hub and fails
+        # under HF_HUB_OFFLINE=1 even when the kernel is cached. A missing build raises => SDPA.
+        return get_kernel(_fa3_kernel_name()).flash_attn_interface
     except Exception:
         return None
 
@@ -193,3 +190,26 @@ flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
 )
+
+
+# =============================================================================
+# python -m nanochat.flash_attention: download the FA3 kernel into the local cache, with retries.
+# Useful behind rate-limited hub mirrors; afterwards runs can use HF_HUB_OFFLINE=1.
+# =============================================================================
+if __name__ == "__main__":
+    import time
+    if not torch.cuda.is_available():
+        print("No CUDA device, nothing to fetch")
+        raise SystemExit(0)
+    from kernels import get_kernel
+    name = _fa3_kernel_name()
+    for attempt in range(1, 9):
+        try:
+            get_kernel(name)
+            print(f"FA3 kernel {name} is cached")
+            break
+        except Exception as e:
+            print(f"Fetching {name} failed (attempt {attempt}): {type(e).__name__}: {e}")
+            time.sleep(15 * attempt)
+    else:
+        print("FA3 kernel unavailable, training will use the SDPA fallback")

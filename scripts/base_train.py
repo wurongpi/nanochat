@@ -51,7 +51,7 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'), auto = SSSL with FA3 else L")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -102,6 +102,10 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
+if args.window_pattern == "auto":
+    # sliding windows are only efficient with FA3, SDPA needs an explicit mask for them
+    args.window_pattern = "SSSL" if using_fa3 else "L"
+    print0(f"Resolved --window-pattern=auto to {args.window_pattern}")
 if using_fa3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
