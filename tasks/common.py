@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from filelock import FileLock
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_base_dir, get_hf_endpoint
 
 
 class HubDataset:
@@ -42,6 +42,14 @@ class HubDataset:
         return row
 
 
+HUB_HEADERS = {"User-Agent": "nanochat/0.1 (https://github.com/karpathy/nanochat)"}
+
+def _hub_get(url):
+    """GET with a real User-Agent: some hub mirrors (e.g. hf-mirror.com) reject the default Python-urllib one."""
+    request = urllib.request.Request(url, headers=HUB_HEADERS)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+
 def load_hub_dataset(repo_id, subset="default", split="train"):
     """
     Minimal stand-in for HuggingFace datasets.load_dataset(repo_id, subset, split=split).
@@ -60,15 +68,16 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
             # only a single rank acquires the lock and downloads, the others block
             # here and then skip the download because they recheck the manifest
             if not os.path.exists(manifest_path):
-                listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
-                with urllib.request.urlopen(listing_url) as response:
-                    shard_urls = json.loads(response.read())
+                endpoint = get_hf_endpoint() # respects HF_ENDPOINT (e.g. https://hf-mirror.com)
+                listing_url = f"{endpoint}/api/datasets/{repo_id}/parquet/{subset}/{split}"
+                shard_urls = json.loads(_hub_get(listing_url))
+                # the listing returns absolute URLs on the official hub, route them through the endpoint too
+                shard_urls = [u.replace("https://huggingface.co", endpoint, 1) for u in shard_urls]
                 filenames = []
                 for shard_index, shard_url in enumerate(shard_urls):
                     filename = f"{shard_index:05d}.parquet"
                     print(f"Downloading {shard_url} ...")
-                    with urllib.request.urlopen(shard_url) as response:
-                        content = response.read()
+                    content = _hub_get(shard_url)
                     with open(os.path.join(shards_dir, filename), "wb") as f:
                         f.write(content)
                     filenames.append(filename)

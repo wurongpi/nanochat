@@ -68,6 +68,13 @@ def setup_default_logging():
 setup_default_logging()
 logger = logging.getLogger(__name__)
 
+def get_hf_endpoint():
+    """
+    HuggingFace endpoint used for all dataset downloads. Defaults to the official hub.
+    Set HF_ENDPOINT=https://hf-mirror.com (e.g. on AutoDL / mainland China machines) to use a mirror.
+    """
+    return os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
     if os.environ.get("NANOCHAT_BASE_DIR"):

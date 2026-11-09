@@ -14,13 +14,13 @@ import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_base_dir, get_hf_endpoint
 
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
 
 # The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+BASE_URL = f"{get_hf_endpoint()}/datasets/karpathy/climbmix-400b-shuffle/resolve/main" # respects HF_ENDPOINT
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
