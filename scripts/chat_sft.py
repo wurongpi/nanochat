@@ -7,6 +7,10 @@ python -m scripts.chat_sft
 Or torchrun for training:
 
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16
+
+Code-CoT SFT on a single GPU (data from scripts/prepare_code_data.py):
+
+python -m scripts.chat_sft --mix=code --code-epochs=3 --max-seq-len=1024 --device-batch-size=16 --total-batch-size=65536
 """
 
 import gc
@@ -29,6 +33,7 @@ from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
+from tasks.code_sft import CodeSFT
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -64,6 +69,9 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--mix", type=str, default="default", choices=["default", "code"], help="default = SmolTalk+MMLU+GSM8K | code = Code-CoT SFT jsonl")
+parser.add_argument("--code-data", type=str, default=None, help="Code-CoT SFT jsonl (default: $NANOCHAT_BASE_DIR/code_sft/code_cot_sft.jsonl)")
+parser.add_argument("--code-epochs", type=int, default=3, help="number of epochs over the Code-CoT data (--mix=code)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -159,18 +167,25 @@ for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
-train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
-    *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
-    *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-]
-train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+if args.mix == "code":
+    code_data_path = args.code_data or os.path.join(base_dir, "code_sft", "code_cot_sft.jsonl")
+    assert os.path.exists(code_data_path), f"{code_data_path} not found, run `python -m scripts.prepare_code_data` first"
+    train_dataset = TaskMixture([CodeSFT(code_data_path, split="train") for _ in range(args.code_epochs)])
+    val_dataset = CodeSFT(code_data_path, split="val")
+    print0(f"Training mixture: {len(train_dataset):,} rows (Code-CoT x{args.code_epochs})")
+else:
+    train_tasks = [
+        SmolTalk(split="train"), # 460K rows of general conversations
+        *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
+        *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
+    ]
+    train_dataset = TaskMixture(train_tasks)
+    print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+    val_dataset = TaskMixture([
+        SmolTalk(split="test"), # 24K rows in test set
+        MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
+        GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
+    ]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
@@ -205,7 +220,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            # truncate: a conversation longer than a row could never be packed
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -359,11 +375,15 @@ while True:
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
-        all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval']
-        categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
+        if args.mix == "code":
+            all_tasks = ['HumanEval', 'MBPP']
+            categorical_tasks = set()
+        else:
+            all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval']
+            categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
         baseline_accuracies = {
             'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
-            'GSM8K': 0.0, 'HumanEval': 0.0,
+            'GSM8K': 0.0, 'HumanEval': 0.0, 'MBPP': 0.0,
         }
         task_results = {}
         for task_name in all_tasks:
@@ -377,7 +397,7 @@ while True:
         def centered_mean(tasks):
             return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
         chatcore = centered_mean(all_tasks)
-        chatcore_cat = centered_mean(categorical_tasks)
+        chatcore_cat = centered_mean(categorical_tasks) if categorical_tasks else 0.0
         print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
         wandb_run.log({
             "step": step,

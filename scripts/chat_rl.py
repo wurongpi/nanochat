@@ -1,5 +1,5 @@
 """
-Reinforcement learning on GSM8K via "GRPO".
+Reinforcement learning on GSM8K (math) or MBPP (Code-RLVR, unit-test reward) via "GRPO".
 
 I put GRPO in quotes because we actually end up with something a lot
 simpler and more similar to just REINFORCE:
@@ -7,18 +7,25 @@ simpler and more similar to just REINFORCE:
 1) Delete trust region, so there is no KL regularization to a reference model
 2) We are on policy, so there's no need for PPO ratio+clip.
 3) We use DAPO style normalization that is token-level, not sequence-level.
-4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
+4) By default, instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
 
 1 GPU:
 python -m scripts.chat_rl
 
 8 GPUs:
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
+
+For MBPP the reward is 1 if the program passes all unit tests and 0 otherwise.
+--adv-norm=zscore uses the GRPO advantage (R - mean(R)) / std(R) instead of R - mean(R).
+
+Code-RLVR on MBPP, 1 GPU:
+python -m scripts.chat_rl --task=mbpp --num-samples=8 --device-batch-size=8 --adv-norm=zscore --num-steps=1000
 """
 
 import argparse
 import os
 import itertools
+from concurrent.futures import ThreadPoolExecutor
 import wandb
 import torch
 import torch.distributed as dist
@@ -26,10 +33,11 @@ from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir,
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
+from tasks.mbpp import MBPP
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
+parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K / MBPP")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -37,12 +45,17 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+# Task
+parser.add_argument("--task", type=str, default="gsm8k", choices=["gsm8k", "mbpp"], help="gsm8k (answer match) | mbpp (unit-test reward)")
 # Training horizon
-parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
+parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over the train split (ignored if --num-steps > 0)")
+parser.add_argument("--num-steps", type=int, default=-1, help="explicit number of optimization steps (-1 = derive from --num-epochs)")
 # Batch sizes / sampling
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
 parser.add_argument("--num-samples", type=int, default=16, help="number of samples per example/question")
+parser.add_argument("--adv-norm", type=str, default="mean", choices=["mean", "zscore"], help="advantage: R - mean(R) | (R - mean(R)) / std(R)")
+parser.add_argument("--reward-workers", type=int, default=8, help="parallel workers scoring the rollouts")
 # Generation
 parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
@@ -77,10 +90,20 @@ engine = Engine(model, tokenizer) # for sampling rollouts
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
 
-train_task = GSM8K(subset="main", split="train")
-val_task = GSM8K(subset="main", split="test")
-num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
+if args.task == "mbpp":
+    train_task = MBPP(split="rl_train") # 474 problems, the test split stays held out
+    val_task = MBPP(split="test")
+else:
+    train_task = GSM8K(subset="main", split="train")
+    val_task = GSM8K(subset="main", split="test")
+print0(f"Task: {args.task} | train problems: {len(train_task)} | val problems: {len(val_task)}")
+if args.num_steps > 0:
+    num_steps = args.num_steps
+else:
+    num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
+assert args.num_samples % args.device_batch_size == 0, "--num-samples must be divisible by --device-batch-size"
+reward_pool = ThreadPoolExecutor(max_workers=args.reward_workers) # MBPP rewards run the tests in subprocesses
 
 @torch.no_grad()
 def get_batch():
@@ -115,15 +138,8 @@ def get_batch():
             masks.extend(masks_batch)
 
         # Calculate the rewards for each sample
-        rewards = []
-        for sample_tokens in generated_token_sequences:
-            # Get just the generated tokens (after the prompt)
-            generated_tokens = sample_tokens[prefix_length:]
-            # Decode the generated response
-            generated_text = tokenizer.decode(generated_tokens)
-            # Calculate the reward
-            reward = train_task.reward(conversation, generated_text)
-            rewards.append(reward)
+        generated_texts = [tokenizer.decode(sample_tokens[prefix_length:]) for sample_tokens in generated_token_sequences]
+        rewards = list(reward_pool.map(lambda text: train_task.reward(conversation, text), generated_texts))
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
@@ -139,15 +155,16 @@ def get_batch():
         # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
         # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
-        mu = rewards.mean()
-        advantages = rewards - mu
+        # Calculate the advantages: subtract the mean, and for GRPO also divide by the std
+        advantages = rewards - rewards.mean()
+        if args.adv_norm == "zscore":
+            advantages = advantages / (rewards.std(unbiased=False) + 1e-4)
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
 # -----------------------------------------------------------------------------
-# Simple evaluation loop for GSM8K pass@k
-def run_gsm8k_eval(task, tokenizer, engine,
+# Simple evaluation loop for pass@k
+def run_passk_eval(task, tokenizer, engine,
     max_examples=None,
     num_samples=1,
     max_completion_tokens=256,
@@ -155,7 +172,7 @@ def run_gsm8k_eval(task, tokenizer, engine,
     top_k=50
 ):
     """
-    Evaluates GSM8K task and returns a list of records of evaluation outcomes.
+    Evaluates the task and returns a list of records of evaluation outcomes.
     In a distributed setting, all ranks cooperate but this function will NOT
     do the reduction across ranks. This is the responsibility of the caller.
     Because the evaluation can take a while, this function will yield records one by one.
@@ -175,14 +192,8 @@ def run_gsm8k_eval(task, tokenizer, engine,
             top_k=top_k
         )
         # Check each sample for correctness
-        outcomes = []
-        for sample_tokens in generated_token_sequences:
-            generated_tokens = sample_tokens[prefix_length:]
-            generated_text = tokenizer.decode(generated_tokens)
-            is_correct = task.evaluate(conversation, generated_text)
-            outcomes.append({
-                "is_correct": is_correct
-            })
+        generated_texts = [tokenizer.decode(sample_tokens[prefix_length:]) for sample_tokens in generated_token_sequences]
+        outcomes = [{"is_correct": c} for c in reward_pool.map(lambda text: task.evaluate(conversation, text), generated_texts)]
         # A bit bloated because I wanted to do more complex logging at one point.
         record = {
             "idx": idx,
@@ -225,7 +236,7 @@ for step in range(num_steps):
     if step % args.eval_every == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
-        records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
+        records_iter = run_passk_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, max_completion_tokens=args.max_new_tokens, temperature=1.0, top_k=args.top_k)
         records = list(records_iter) # collect all records
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
@@ -245,9 +256,19 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    num_backward = 0 # number of groups that actually produced gradients this step
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        # For logging
+        rewards_list.append(rewards_all.mean().item())
+        sequence_lengths.extend(len(seq) for seq in sequences_all)
+        # A group where every sample got the same reward has A=0 everywhere => exactly zero gradient.
+        # On a single GPU we can skip its forward/backward entirely (big speedup early in Code-RLVR).
+        # (With DDP every rank must participate in every backward, so we don't skip there.)
+        if not ddp and advantages_all.abs().max().item() == 0.0:
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | zero-advantage group (reward={rewards_all.mean().item():.2f}), skipped")
+            continue
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -271,10 +292,8 @@ for step in range(num_steps):
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             loss.backward()
+            num_backward += 1
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
-        # For logging
-        rewards_list.append(rewards_all.mean().item())
-        sequence_lengths.extend(len(seq) for seq in sequences_all)
 
     # A bunch of logging for how the rollouts went this step
     mean_reward = sum(rewards_list) / len(rewards_list)
@@ -297,7 +316,10 @@ for step in range(num_steps):
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-    optimizer.step()
+    if num_backward > 0 or ddp:
+        optimizer.step()
+    else:
+        print0(f"Step {step}/{num_steps} | all groups had zero advantage, no parameter update this step")
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
@@ -322,5 +344,6 @@ for step in range(num_steps):
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
+reward_pool.shutdown()
 wandb_run.finish() # wandb run finish
 compute_cleanup()
