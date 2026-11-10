@@ -45,9 +45,11 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-tag", type=str, default=None, help="tag to save the RL checkpoints under (default: same as --model-tag), so several RL runs can start from one SFT model")
 # Task
 parser.add_argument("--task", type=str, default="gsm8k", choices=["gsm8k", "mbpp"], help="gsm8k (answer match) | mbpp (unit-test reward)")
 # Training horizon
+parser.add_argument("--reward", type=str, default="exact", choices=["exact", "contains"], help="gsm8k only. exact: the final '#### answer' must match | contains: the naive 'reference number appears anywhere' reward (reward-design experiment). Evaluation is always exact.")
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over the train split (ignored if --num-steps > 0)")
 parser.add_argument("--num-steps", type=int, default=-1, help="explicit number of optimization steps (-1 = derive from --num-epochs)")
 # Batch sizes / sampling
@@ -70,6 +72,7 @@ parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+parser.add_argument("--min-signal", type=float, default=0.0, help="abort before any update if the step-0 pass@k (k = device batch size) is below this: with no correct rollouts there is nothing to reinforce")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -96,6 +99,9 @@ if args.task == "mbpp":
 else:
     train_task = GSM8K(subset="main", split="train")
     val_task = GSM8K(subset="main", split="test")
+assert args.reward == "exact" or args.task == "gsm8k", "--reward=contains is only defined for gsm8k"
+reward_fn = train_task.reward if args.reward == "exact" else train_task.reward_contains # what RL optimizes
+true_reward_means = [] # per group: the mean STRICT reward of its rollouts (logged next to the optimized reward)
 print0(f"Task: {args.task} | train problems: {len(train_task)} | val problems: {len(val_task)}")
 if args.num_steps > 0:
     num_steps = args.num_steps
@@ -139,7 +145,9 @@ def get_batch():
 
         # Calculate the rewards for each sample
         generated_texts = [tokenizer.decode(sample_tokens[prefix_length:]) for sample_tokens in generated_token_sequences]
-        rewards = list(reward_pool.map(lambda text: train_task.reward(conversation, text), generated_texts))
+        rewards = list(reward_pool.map(lambda text: reward_fn(conversation, text), generated_texts))
+        true_rewards = rewards if args.reward == "exact" else [train_task.reward(conversation, text) for text in generated_texts]
+        true_reward_means.append(sum(true_rewards) / len(true_rewards))
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
@@ -247,6 +255,10 @@ for step in range(num_steps):
         passk = passk / num_records.item() # normalize by the total number of records
         print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, args.device_batch_size + 1)]
         print0(f"Step {step} | {', '.join(print_passk)}")
+        if step == 0 and passk[-1].item() < args.min_signal:
+            print0(f"ABORT: pass@{args.device_batch_size} = {passk[-1].item():.4f} is below --min-signal={args.min_signal}. "
+                   f"Almost every group would have zero advantage, so RL has nothing to learn from. Improve the SFT model first.")
+            raise SystemExit(2)
         log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, args.device_batch_size + 1)}
         wandb_run.log({
             "step": step,
@@ -257,12 +269,15 @@ for step in range(num_steps):
     rewards_list = []
     sequence_lengths = []
     num_backward = 0 # number of groups that actually produced gradients this step
+    num_signal_groups = 0 # groups with a non-zero advantage, i.e. a mix of right and wrong rollouts
+    true_reward_means.clear()
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
         # For logging
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
+        num_signal_groups += int(advantages_all.abs().max().item() > 0.0)
         # A group where every sample got the same reward has A=0 everywhere => exactly zero gradient.
         # On a single GPU we can skip its forward/backward entirely (big speedup early in Code-RLVR).
         # (With DDP every rank must participate in every backward, so we don't skip there.)
@@ -305,10 +320,13 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    mean_true_reward = sum(true_reward_means) / max(1, len(true_reward_means)) # this rank only
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | True (strict) reward: {mean_true_reward:.4f} | Average sequence length: {mean_sequence_length:.2f} | groups with signal: {num_signal_groups}/{examples_per_rank}")
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
+        "true_reward": mean_true_reward,
+        "signal_groups": num_signal_groups,
         "sequence_length": mean_sequence_length,
     })
 
@@ -330,7 +348,7 @@ for step in range(num_steps):
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
+        output_dirname = args.output_tag or args.model_tag or f"d{depth}" # default: the model tag, else the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
         model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
         save_checkpoint(

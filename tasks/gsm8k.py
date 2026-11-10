@@ -19,6 +19,7 @@ from tasks.common import Task, load_hub_dataset
 
 
 GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+NUM_RE = re.compile(r"\-?[0-9][0-9\,]*(?:\.[0-9]+)?") # any number in free text (used by reward_contains)
 def extract_answer(completion):
     """
     Extract the numerical answer after #### marker.
@@ -105,6 +106,17 @@ class GSM8K(Task):
         # Compare and return the success as int
         is_correct = int(pred_num == ref_num)
         return is_correct
+
+    def reward_contains(self, conversation, assistant_response):
+        """
+        A deliberately NAIVE reward for the reward-design experiment (scripts.chat_rl --reward=contains):
+        1.0 if the reference number appears ANYWHERE in the response, not only as the final "#### answer".
+        It looks reasonable ("did the model produce the right number?") but can be gamed by emitting many
+        numbers. Never use it for evaluation: evaluate() stays the strict check.
+        """
+        ref_num = extract_answer(conversation['messages'][-1]['content'][-1]['text'])
+        numbers = {m.replace(",", "").rstrip(".") for m in NUM_RE.findall(assistant_response)}
+        return float(ref_num is not None and ref_num in numbers)
 
     def reward(self, conversation, assistant_response):
         """
