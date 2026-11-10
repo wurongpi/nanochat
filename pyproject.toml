@@ -65,6 +65,10 @@ hub = [
     "matplotlib>=3.10.0",
     "modelscope>=1.20.0",
 ]
+eval = [
+    # EvalPlus (HumanEval+ / MBPP+) scoring for scripts/code_reeval.py and runs/code_reeval.sh
+    "evalplus>=0.3.0",
+]
 
 [tool.uv]
 default-groups = []
