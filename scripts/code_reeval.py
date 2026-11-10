@@ -21,6 +21,8 @@ Examples:
   python -m scripts.code_reeval --sources=sft,rl                              # greedy pass@1
   python -m scripts.code_reeval --sources=sft,rl --num-samples=10 --temperature=0.6   # pass@1, pass@5, pass@10
   python -m scripts.code_reeval --tasks=HumanEval,MBPP,MBPPPlus ...           # also generate for MBPP+
+  # RL signal check: pass@8 of the SFT model on the RL training problems, with the RL rollout settings
+  python -m scripts.code_reeval --sources=sft --tasks=MBPP --mbpp-split=rl_train --num-samples=8 --temperature=1.0 --ks=1,8
 Outputs go to $NANOCHAT_BASE_DIR/eval_fixed/<T..._n..._tok...>/ ; see runs/code_reeval.sh for the full suite.
 Scoring logic: tasks/code_scoring.py (tests: tests/test_code_scoring.py). EvalPlus: `uv sync --extra eval`.
 """
@@ -46,6 +48,8 @@ parser.add_argument("--temperature", type=float, default=0.0)
 parser.add_argument("--top-k", type=int, default=50)
 parser.add_argument("--ks", type=str, default="1,5,10", help="pass@k values to report (only k <= num-samples)")
 parser.add_argument("--max-problems", type=int, default=None)
+parser.add_argument("--mbpp-split", type=str, default="test",
+                    help="MBPP split: test (benchmark) | rl_train (the 474 RL training problems: is there any RL signal?)")
 parser.add_argument("--workers", type=int, default=8, help="parallel code executions")
 parser.add_argument("--no-early-stop", action="store_true", help="do not stop a row when its first code block closes")
 parser.add_argument("--no-evalplus-export", action="store_true")
@@ -89,7 +93,7 @@ def build_task(name):
     if name == "HumanEval":
         return HumanEval()
     if name == "MBPP":
-        return MBPP(split="test")
+        return MBPP(split=args.mbpp_split)
     if name == "MBPPPlus":
         return MBPPPlus()
     raise ValueError(name)
@@ -158,7 +162,8 @@ def generate(engine, tokenizer, prompt_tokens, seed):
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 _, _, _, _, device = compute_init(device_type)
-out_name = args.out_name or f"T{args.temperature:g}_n{args.num_samples}_tok{args.max_new_tokens}"
+out_name = args.out_name or (f"T{args.temperature:g}_n{args.num_samples}_tok{args.max_new_tokens}"
+                             + ("" if args.mbpp_split == "test" else f"_mbpp-{args.mbpp_split}"))
 out_dir = os.path.join(get_base_dir(), "eval_fixed", out_name)
 os.makedirs(out_dir, exist_ok=True)
 pool = ThreadPoolExecutor(max_workers=args.workers)  # each execution is its own subprocess
