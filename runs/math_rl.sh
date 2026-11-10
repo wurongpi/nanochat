@@ -23,6 +23,8 @@ START_STAGE="${START_STAGE:-sft}"
 REWARDS="${REWARDS:-exact contains}"
 NUM_STEPS="${NUM_STEPS:-300}"
 MIN_SIGNAL="${MIN_SIGNAL:-0.02}"
+SEED="${SEED:-0}" # RL run seed; SEED!=0 saves to <tag>-<reward>-s<SEED> and logs to rl_<reward>-s<SEED>.log
+SFX=""; [ "$SEED" != "0" ] && SFX="-s$SEED"
 BASE_TAG="${BASE_TAG:-d12}"
 TAG="${TAG:-d12-math}"
 SFT_DBS="${SFT_DBS:-32}"
@@ -70,29 +72,29 @@ fi
 if run_stage rl; then
     for R in $REWARDS; do
         echo "=== rl: reward=$R ==="
-        python -m scripts.chat_rl --task=gsm8k --reward="$R" --model-tag="$TAG" --output-tag="$TAG-$R" \
+        python -m scripts.chat_rl --task=gsm8k --reward="$R" --model-tag="$TAG" --output-tag="$TAG-$R$SFX" --seed="$SEED" \
             --num-samples=16 --device-batch-size=16 --examples-per-step=8 --num-steps="$NUM_STEPS" \
-            --eval-every=100 --eval-examples=200 --save-every=100 --min-signal="$MIN_SIGNAL" 2>&1 | tee "$LOGS/rl_$R.log"
+            --eval-every=100 --eval-examples=200 --save-every=100 --min-signal="$MIN_SIGNAL" 2>&1 | tee "$LOGS/rl_$R$SFX.log"
     done
 fi
 
 if run_stage eval; then
     for R in $REWARDS; do
         echo "=== eval: RL model (reward=$R) on held-out GSM8K ==="
-        gsm8k_eval rl "$TAG-$R" "eval_rl_$R"
+        gsm8k_eval rl "$TAG-$R$SFX" "eval_rl_$R$SFX"
     done
 fi
 
 echo
 echo "==================== SUMMARY ===================="
 echo "held-out GSM8K (greedy, strict):"
-for f in eval_sft $(for R in $REWARDS; do echo "eval_rl_$R"; done); do
+for f in eval_sft $(for R in $REWARDS; do echo "eval_rl_$R$SFX"; done); do
     [ -f "$LOGS/$f.log" ] && echo "  $f: $(grep -E 'GSM8K accuracy' "$LOGS/$f.log" | tail -1)"
 done
 for R in $REWARDS; do
-    [ -f "$LOGS/rl_$R.log" ] || continue
-    echo "rl reward=$R (first / last 20 steps: optimized reward | true reward | sequence length):"
-    python - "$LOGS/rl_$R.log" <<'PY'
+    [ -f "$LOGS/rl_$R$SFX.log" ] || continue
+    echo "rl reward=$R$SFX (first / last 20 steps: optimized reward | true reward | sequence length):"
+    python - "$LOGS/rl_$R$SFX.log" <<'PY'
 import re, sys
 rows = [tuple(map(float, m.groups())) for m in re.finditer(
     r"Average reward: ([\d.eE+-]+) \| True \(strict\) reward: ([\d.]+) \| Average sequence length: ([\d.]+)", open(sys.argv[1]).read())]
@@ -100,6 +102,6 @@ avg = lambda xs, i: sum(x[i] for x in xs) / max(1, len(xs))
 for name, part in (("first", rows[:20]), ("last ", rows[-20:])):
     print(f"  {name}: {avg(part,0):.4f} | {avg(part,1):.4f} | {avg(part,2):.1f}   ({len(part)} steps)")
 PY
-    grep -E "^Step [0-9]+ \| Pass@1:" "$LOGS/rl_$R.log" | sed -E 's/^(Step [0-9]+) \| (Pass@1: [0-9.]+).*(Pass@16: [0-9.]+).*/  \1 | \2 | \3/' || true
+    grep -E "^Step [0-9]+ \| Pass@1:" "$LOGS/rl_$R$SFX.log" | sed -E 's/^(Step [0-9]+) \| (Pass@1: [0-9.]+).*(Pass@16: [0-9.]+).*/  \1 | \2 | \3/' || true
 done
 echo "Logs: $LOGS"

@@ -25,6 +25,7 @@ python -m scripts.chat_rl --task=mbpp --num-samples=8 --device-batch-size=8 --ad
 import argparse
 import os
 import itertools
+import random
 from concurrent.futures import ThreadPoolExecutor
 import wandb
 import torch
@@ -45,6 +46,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--seed", type=int, default=0, help="run seed: changes the rollout sampling and the order of the training problems (0 = the original deterministic behavior)")
 parser.add_argument("--output-tag", type=str, default=None, help="tag to save the RL checkpoints under (default: same as --model-tag), so several RL runs can start from one SFT model")
 # Task
 parser.add_argument("--task", type=str, default="gsm8k", choices=["gsm8k", "mbpp"], help="gsm8k (answer match) | mbpp (unit-test reward)")
@@ -114,7 +116,9 @@ reward_pool = ThreadPoolExecutor(max_workers=args.reward_workers) # MBPP rewards
 @torch.no_grad()
 def get_batch():
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
-    rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
+    rank_indices = list(range(ddp_rank, len(train_task), ddp_world_size)) # each rank is responsible for different examples in the training data
+    if args.seed != 0:
+        random.Random(args.seed).shuffle(rank_indices) # a different problem order per run seed
     for example_idx in itertools.cycle(rank_indices):
 
         # First get the full conversation of both user and assistant messages
@@ -131,7 +135,8 @@ def get_batch():
         masks = []
         num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
-            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
+            seed_key = (step, example_idx, sampling_step) if args.seed == 0 else (args.seed, step, example_idx, sampling_step)
+            seed = hash(seed_key) & 0x7FFFFFFF # positive half of int32 (tuples of ints hash deterministically)
             generated_token_sequences_batch, masks_batch = engine.generate_batch(
                 tokens,
                 num_samples=args.device_batch_size,
