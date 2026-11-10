@@ -7,6 +7,7 @@ Fixes over the original pipeline (tasks.humaneval.extract_program + "returncode 
     demo calls, `if __name__` blocks and top-level exits cannot break or fake the run; a half-written
     trailing line is trimmed until the code parses
   - a sentinel is printed AFTER the tests: exiting early (sys.exit, raise SystemExit, os._exit) is a fail
+  - MBPP programs are assembled solution -> setup -> tests (the original puts the setup first)
 Also: a hard-coding heuristic for the visible MBPP tests and the unbiased pass@k estimator.
 """
 
@@ -16,7 +17,7 @@ import math
 
 from nanochat.execution import execute_code
 from tasks.humaneval import extract_imports
-from tasks.mbpp import build_test_program, _normalize
+from tasks.mbpp import _normalize
 
 SENTINEL = "__ALL_TESTS_PASSED_9c2e41__"
 EXIT_HACK_RE = re.compile(r"sys\.exit|SystemExit|os\._exit|\bquit\(|(?<![\w.])exit\(")
@@ -63,6 +64,19 @@ def run_with_sentinel(program, timeout=5.0):
     r = execute_code(program + f"\nprint({SENTINEL!r})\n", timeout=timeout)
     ok = r.success and SENTINEL in r.stdout
     return ok, (None if ok else (r.error or ("exited before tests finished" if r.success else "failed")))
+
+
+def mbpp_program(code, test_setup_code, test_list):
+    """
+    Solution FIRST, then the setup code, then the asserts. tasks.mbpp.build_test_program puts the setup first,
+    which breaks problems whose setup builds objects from a class the solution defines (e.g. a tree `Node`).
+    Setup definitions are only used when the asserts run, so this order is safe for every problem.
+    """
+    parts = [code]
+    if test_setup_code and test_setup_code.strip():
+        parts.append(_normalize(test_setup_code))
+    parts.extend(_normalize(t) for t in test_list)
+    return "\n\n".join(parts) + "\n"
 
 
 def humaneval_solution(prompt, entry_point, code):
@@ -112,10 +126,10 @@ def score_completion(task_name, conversation, completion, challenge_tests=None, 
         s["fixed"], s["error"] = run_with_sentinel(program, timeout=timeout)
     elif task_name == "MBPP":
         setup = conversation["test_setup_code"]
-        s["fixed"], s["error"] = run_with_sentinel(build_test_program(code, setup, conversation["test_list"]), timeout=timeout)
+        s["fixed"], s["error"] = run_with_sentinel(mbpp_program(code, setup, conversation["test_list"]), timeout=timeout)
         if challenge_tests:
             tests = [_normalize(t) for t in challenge_tests]
-            s["hidden"], _ = run_with_sentinel(build_test_program(code, setup, tests), timeout=timeout)
+            s["hidden"], _ = run_with_sentinel(mbpp_program(code, setup, tests), timeout=timeout)
         s["hardcode"] = hardcode_suspect(code, conversation["test_list"])
     return s
 

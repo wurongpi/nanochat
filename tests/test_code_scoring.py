@@ -7,7 +7,7 @@ python -m pytest tests/test_code_scoring.py -v
 import pytest
 
 from tasks.code_scoring import (extract_code, sanitize, run_with_sentinel, humaneval_solution,
-                                hardcode_suspect, score_completion, pass_at_k)
+                                hardcode_suspect, score_completion, pass_at_k, mbpp_program)
 from tasks.mbpp import build_test_program
 from nanochat.execution import execute_code
 
@@ -93,3 +93,14 @@ def test_pass_at_k():
     assert pass_at_k(10, 3, 1) == pytest.approx(0.3)
     assert pass_at_k(4, 2, 2) == pytest.approx(1 - 1 / 6)
     assert pass_at_k(10, 1, 10) == 1.0
+
+
+def test_mbpp_setup_uses_class_defined_by_the_solution():
+    # like MBPP's tree problems: the setup builds a tree from the `Node` class that the solution defines
+    conv = {"test_list": ["assert depth(root) == 2"],
+            "test_setup_code": "root = Node(1)\nroot.left = Node(2)"}
+    code = ("class Node:\n    def __init__(self, v):\n        self.v, self.left, self.right = v, None, None\n"
+            "def depth(n):\n    return 0 if n is None else 1 + max(depth(n.left), depth(n.right))")
+    assert not execute_code(build_test_program(code, conv["test_setup_code"], conv["test_list"])).success
+    assert run_with_sentinel(mbpp_program(code, conv["test_setup_code"], conv["test_list"]))[0]
+    assert score_completion("MBPP", conv, block(code))["fixed"]
