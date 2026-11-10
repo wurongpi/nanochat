@@ -17,6 +17,7 @@
 #        BASE_TAG (d12) TAG (d12-math) SFT_DBS (32) TORCH_EXTRA (gpu) SKIP_SYNC=1 EVAL_PROBLEMS (all)
 set -euo pipefail
 export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1 # the stages are piped into tee: without this, progress shows up in 8KB bursts
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 START_STAGE="${START_STAGE:-sft}"
 REWARDS="${REWARDS:-exact contains}"
