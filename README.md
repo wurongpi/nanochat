@@ -1,5 +1,7 @@
 # nanochat
 
+> **This fork (`code-rlvr` branch):** a single-GPU d12 run through pretraining, code SFT and GRPO, a reward-hacking failure found in it (the published MBPP 99.2% was the model calling `sys.exit` before the tests; 0% with a fixed grader), the fixed evaluation, and a controlled GSM8K experiment that reproduces the effect. Write-up: [docs/reward_hacking.md](docs/reward_hacking.md).
+
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
 
